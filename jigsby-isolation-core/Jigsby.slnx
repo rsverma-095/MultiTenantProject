@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Jigsby.Core/Jigsby.Core.csproj" />
+    <Project Path="src/Jigsby.Infrastructure/Jigsby.Infrastructure.csproj" />
+    <Project Path="src/Jigsby.Api/Jigsby.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Jigsby.Tenancy.Tests/Jigsby.Tenancy.Tests.csproj" />
+  </Folder>
+</Solution>

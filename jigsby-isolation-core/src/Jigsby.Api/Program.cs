@@ -11,6 +11,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -68,6 +69,15 @@ await InitializeDatabaseAsync(app);
 
 // --- Middleware order matters --------------------------------------------------
 app.MapOpenApi();
+app.MapScalarApiReference(options =>
+{
+    options.Title = "Jigsby API";
+    options.Theme = ScalarTheme.Purple;
+});
+
+// Redirect root to the Scalar UI
+app.MapGet("/", () => Results.Redirect("/scalar/v1")).AllowAnonymous();
+
 app.UseAuthentication();
 app.UseMiddleware<TenantResolutionMiddleware>();
 app.UseAuthorization();

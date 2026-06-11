@@ -11,4 +11,13 @@
     <ProjectReference Include="..\Jigsby.Infrastructure\Jigsby.Infrastructure.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.9" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\Jigsby.Infrastructure\Migrations\Sql\001_RowLevelSecurity.sql" Link="Sql\001_RowLevelSecurity.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

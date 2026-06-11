@@ -20,6 +20,12 @@ IF SCHEMA_ID(N'sec') IS NULL
     EXEC(N'CREATE SCHEMA sec;');
 GO
 
+-- Drop the policy first so we can replace the predicate function below.
+-- The function cannot be altered while referenced by a security policy.
+IF EXISTS (SELECT 1 FROM sys.security_policies WHERE name = N'TenantSecurityPolicy' AND schema_id = SCHEMA_ID(N'sec'))
+    DROP SECURITY POLICY sec.TenantSecurityPolicy;
+GO
+
 CREATE OR ALTER FUNCTION sec.fn_tenant_predicate(@TenantId uniqueidentifier)
     RETURNS TABLE
     WITH SCHEMABINDING
@@ -32,7 +38,7 @@ GO
 -- If no tenant is set in SESSION_CONTEXT, CAST(...) is NULL, the equality is unknown,
 -- and zero rows pass the predicate. That is the fail-closed behaviour we want.
 
-CREATE OR ALTER SECURITY POLICY sec.TenantSecurityPolicy
+CREATE SECURITY POLICY sec.TenantSecurityPolicy
     ADD FILTER PREDICATE sec.fn_tenant_predicate(TenantId) ON dbo.Contacts,
     ADD BLOCK PREDICATE  sec.fn_tenant_predicate(TenantId) ON dbo.Contacts AFTER INSERT,
     ADD FILTER PREDICATE sec.fn_tenant_predicate(TenantId) ON dbo.Companies,

@@ -3,21 +3,19 @@ using Jigsby.Core.Tenancy;
 namespace Jigsby.Api.Middleware;
 
 /// <summary>
-/// Establishes the tenant context for each request from the authenticated principal's
-/// "tenant_id" claim, which is issued at sign-in.
+/// Establishes the tenant context for each request.
 ///
-/// Must run AFTER authentication (so the claim is available) and BEFORE anything that
-/// touches tenant-owned data. See Program.cs for ordering.
+/// Tenant resolution order:
+///   1. X-Tenant-Id request header  (development / direct API calls)
+///   2. "tenant_id" JWT claim        (production, once auth is added)
 ///
-/// If there is no valid tenant claim (anonymous request, or an auth/account endpoint
-/// that legitimately runs outside a tenant), no scope is opened. Any tenant-owned data
-/// access in that state then fails closed: reads return nothing, writes throw, and the
-/// database RLS layer matches no rows. There is intentionally no path here that grants
-/// access to all tenants.
+/// If neither is present the request proceeds with no tenant scope:
+/// reads return nothing and writes throw (fail-closed).
 /// </summary>
 public sealed class TenantResolutionMiddleware
 {
-    public const string TenantClaimType = "tenant_id";
+    public const string TenantClaimType  = "tenant_id";
+    public const string TenantHeaderName = "X-Tenant-Id";
 
     private readonly RequestDelegate _next;
 
@@ -25,11 +23,11 @@ public sealed class TenantResolutionMiddleware
 
     public async Task InvokeAsync(HttpContext context, ITenantContext tenantContext)
     {
-        var claim = context.User?.FindFirst(TenantClaimType)?.Value;
+        var tenantId = ResolveFromHeader(context) ?? ResolveFromClaim(context);
 
-        if (Guid.TryParse(claim, out var tenantId) && tenantId != Guid.Empty)
+        if (tenantId.HasValue)
         {
-            using (tenantContext.BeginScope(tenantId))
+            using (tenantContext.BeginScope(tenantId.Value))
             {
                 await _next(context);
             }
@@ -38,5 +36,17 @@ public sealed class TenantResolutionMiddleware
         {
             await _next(context);
         }
+    }
+
+    private static Guid? ResolveFromHeader(HttpContext context)
+    {
+        var value = context.Request.Headers[TenantHeaderName].FirstOrDefault();
+        return Guid.TryParse(value, out var id) && id != Guid.Empty ? id : null;
+    }
+
+    private static Guid? ResolveFromClaim(HttpContext context)
+    {
+        var value = context.User?.FindFirst(TenantClaimType)?.Value;
+        return Guid.TryParse(value, out var id) && id != Guid.Empty ? id : null;
     }
 }

@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using Jigsby.Core.Entities;
 using Jigsby.Infrastructure.Data;
 using Microsoft.AspNetCore.Authorization;
@@ -12,7 +13,6 @@ namespace Jigsby.Api.Controllers;
 public sealed class ContactsController : ControllerBase
 {
     private readonly AppDbContext _db;
-
     public ContactsController(AppDbContext db) => _db = db;
 
     [HttpGet]
@@ -27,24 +27,37 @@ public sealed class ContactsController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<ActionResult<Contact>> Create(Contact contact)
+    public async Task<ActionResult<Contact>> Create(CreateContactRequest req)
     {
-        contact.Id = Guid.NewGuid();
+        if (req.CompanyId.HasValue && !await _db.Companies.AnyAsync(c => c.Id == req.CompanyId))
+            return BadRequest("Company not found in the current tenant.");
+
+        var contact = new Contact
+        {
+            Id        = Guid.NewGuid(),
+            FirstName = req.FirstName,
+            LastName  = req.LastName,
+            Email     = req.Email,
+            CompanyId = req.CompanyId
+        };
         _db.Contacts.Add(contact);
         await _db.SaveChangesAsync();
         return CreatedAtAction(nameof(Get), new { id = contact.Id }, contact);
     }
 
     [HttpPut("{id:guid}")]
-    public async Task<ActionResult<Contact>> Update(Guid id, Contact contact)
+    public async Task<ActionResult<Contact>> Update(Guid id, UpdateContactRequest req)
     {
         var existing = await _db.Contacts.FirstOrDefaultAsync(c => c.Id == id);
         if (existing is null) return NotFound();
 
-        existing.FirstName = contact.FirstName;
-        existing.LastName  = contact.LastName;
-        existing.Email     = contact.Email;
-        existing.CompanyId = contact.CompanyId;
+        if (req.CompanyId.HasValue && !await _db.Companies.AnyAsync(c => c.Id == req.CompanyId))
+            return BadRequest("Company not found in the current tenant.");
+
+        existing.FirstName = req.FirstName;
+        existing.LastName  = req.LastName;
+        existing.Email     = req.Email;
+        existing.CompanyId = req.CompanyId;
 
         await _db.SaveChangesAsync();
         return existing;
@@ -55,9 +68,20 @@ public sealed class ContactsController : ControllerBase
     {
         var existing = await _db.Contacts.FirstOrDefaultAsync(c => c.Id == id);
         if (existing is null) return NotFound();
-
         _db.Contacts.Remove(existing);
         await _db.SaveChangesAsync();
         return NoContent();
     }
 }
+
+public record CreateContactRequest(
+    [Required, StringLength(100)] string FirstName,
+    [Required, StringLength(100)] string LastName,
+    [EmailAddress, StringLength(256)] string? Email,
+    Guid? CompanyId);
+
+public record UpdateContactRequest(
+    [Required, StringLength(100)] string FirstName,
+    [Required, StringLength(100)] string LastName,
+    [EmailAddress, StringLength(256)] string? Email,
+    Guid? CompanyId);

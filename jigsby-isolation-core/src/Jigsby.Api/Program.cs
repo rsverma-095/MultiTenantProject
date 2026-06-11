@@ -1,41 +1,48 @@
 using System.Text;
+using System.Threading.RateLimiting;
 using Jigsby.Api.Auth;
+using Jigsby.Api.Health;
 using Jigsby.Api.Middleware;
 using Jigsby.Core.Entities;
 using Jigsby.Core.Tenancy;
 using Jigsby.Infrastructure.Data;
 using Jigsby.Infrastructure.Tenancy;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// --- Tenancy wiring -------------------------------------------------------------
+// --- Tenancy wiring -----------------------------------------------------------
 builder.Services.AddSingleton<ITenantContext, AmbientTenantContext>();
 builder.Services.AddSingleton<TenantSessionConnectionInterceptor>();
 
-// --- Data ----------------------------------------------------------------------
+// --- Data ---------------------------------------------------------------------
 builder.Services.AddDbContext<AppDbContext>((sp, options) =>
     options
         .UseSqlServer(builder.Configuration.GetConnectionString("Default"))
         .AddInterceptors(sp.GetRequiredService<TenantSessionConnectionInterceptor>()));
 
-// --- Identity ------------------------------------------------------------------
+// --- Identity -----------------------------------------------------------------
 builder.Services
     .AddIdentityCore<ApplicationUser>(o =>
     {
-        o.Password.RequiredLength  = 12;
-        o.User.RequireUniqueEmail  = true;
+        o.Password.RequiredLength = 12;
+        o.User.RequireUniqueEmail = true;
     })
     .AddRoles<IdentityRole<Guid>>()
     .AddEntityFrameworkStores<AppDbContext>();
 
-// --- JWT authentication --------------------------------------------------------
-var jwtKey = builder.Configuration["Jwt:Key"]!;
+// --- JWT authentication -------------------------------------------------------
+var jwtKey = builder.Configuration["Jwt:Key"]
+    ?? throw new InvalidOperationException("Jwt:Key is not configured.");
+if (jwtKey.Length < 32)
+    throw new InvalidOperationException("Jwt:Key must be at least 32 characters.");
 
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -49,62 +56,129 @@ builder.Services
             ValidateIssuerSigningKey = true,
             ValidIssuer              = builder.Configuration["Jwt:Issuer"],
             ValidAudience            = builder.Configuration["Jwt:Audience"],
-            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
+            ClockSkew                = TimeSpan.Zero
         };
     });
 
-builder.Services.AddAuthorization();
+// --- Authorization ------------------------------------------------------------
+builder.Services.AddAuthorization(o =>
+    o.AddPolicy("AdminOnly", p => p.RequireRole("admin")));
+
+// --- Application services -----------------------------------------------------
 builder.Services.AddSingleton<JwtTokenService>();
 builder.Services.AddScoped<RefreshTokenService>();
 
-builder.Services.AddControllers();
-builder.Services.AddOpenApi();
+// --- Health checks ------------------------------------------------------------
+var connectionString = builder.Configuration.GetConnectionString("Default")!;
+builder.Services.AddSingleton(new SqlConnectionHealthCheck(connectionString));
+builder.Services.AddHealthChecks()
+    .AddCheck<SqlConnectionHealthCheck>("database", failureStatus: HealthStatus.Unhealthy, tags: ["db"]);
 
+// --- CORS ---------------------------------------------------------------------
+builder.Services.AddCors(options =>
+    options.AddPolicy("Default", policy =>
+        policy
+            .WithOrigins(builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [])
+            .AllowAnyHeader()
+            .AllowAnyMethod()));
+
+// --- Rate limiting ------------------------------------------------------------
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("auth", _ =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "global-auth",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit      = 20,
+                Window           = TimeSpan.FromMinutes(1),
+                QueueLimit       = 0,
+                AutoReplenishment = true
+            }));
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+});
+
+// --- Problem details (global exception handler) --------------------------------
+builder.Services.AddProblemDetails();
+
+// --- API / Docs ---------------------------------------------------------------
+builder.Services.AddControllers();
+
+if (builder.Environment.IsDevelopment())
+    builder.Services.AddOpenApi();
+
+// ==============================================================================
 var app = builder.Build();
 
-// --- Database: create schema, seed, apply RLS ----------------------------------
 await InitializeDatabaseAsync(app);
 
-// --- API docs ------------------------------------------------------------------
-app.MapOpenApi();
-app.MapScalarApiReference(o =>
-{
-    o.Title = "Jigsby API";
-    o.Theme = ScalarTheme.Purple;
-    o.AddServer(new ScalarServer("http://localhost:5000"));
-    o.Authentication = new ScalarAuthenticationOptions
-    {
-        PreferredSecurityScheme = "Bearer"
-    };
-});
-app.MapGet("/", () => Results.Redirect("/scalar/v1")).AllowAnonymous();
+// --- Middleware pipeline (order matters) --------------------------------------
+app.UseExceptionHandler();
 
-// --- Middleware pipeline (order matters) ---------------------------------------
-app.UseAuthentication();                           // 1. populate context.User from JWT
-app.UseMiddleware<TenantResolutionMiddleware>();   // 2. open tenant scope from claim or header
-app.UseAuthorization();                            // 3. enforce [Authorize]
+if (!app.Environment.IsDevelopment())
+    app.UseHttpsRedirection();
+
+app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseCors("Default");
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseMiddleware<TenantResolutionMiddleware>();
+app.UseAuthorization();
 app.MapControllers();
 
-// Public utility endpoints
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" })).AllowAnonymous();
-app.MapGet("/dev/tenants", async (AppDbContext db) =>
-    Results.Ok(await db.Tenants.OrderBy(t => t.Name).Select(t => new { t.Id, t.Name }).ToListAsync()))
-   .AllowAnonymous();
+// --- Health check (always public, minimal info in production) -----------------
+app.MapHealthChecks("/health", new HealthCheckOptions
+{
+    ResponseWriter = async (ctx, report) =>
+    {
+        ctx.Response.ContentType = "application/json";
+        await ctx.Response.WriteAsJsonAsync(new
+        {
+            status = report.Status.ToString(),
+            checks = report.Entries.ToDictionary(e => e.Key, e => e.Value.Status.ToString())
+        });
+    }
+}).AllowAnonymous();
+
+// --- API docs (development only) ----------------------------------------------
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference(o =>
+    {
+        o.Title = "Jigsby API";
+        o.Theme = ScalarTheme.Purple;
+        o.AddServer(new ScalarServer("http://localhost:5000"));
+        o.Authentication = new ScalarAuthenticationOptions
+        {
+            PreferredSecuritySchemes = ["Bearer"]
+        };
+    });
+    app.MapGet("/", () => Results.Redirect("/scalar/v1")).AllowAnonymous();
+}
 
 app.Run();
 
-// ---------------------------------------------------------------------------
+// ==============================================================================
+
 static async Task InitializeDatabaseAsync(WebApplication app)
 {
     var logger = app.Services.GetRequiredService<ILogger<Program>>();
-
-    using var scope      = app.Services.CreateScope();
-    var db               = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var tenantCtx        = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+    using var scope = app.Services.CreateScope();
+    var sp          = scope.ServiceProvider;
+    var db          = sp.GetRequiredService<AppDbContext>();
+    var tenantCtx   = sp.GetRequiredService<ITenantContext>();
 
     await db.Database.EnsureCreatedAsync();
-    await EnsureRefreshTokensTableAsync(app.Configuration.GetConnectionString("Default")!, logger);
-    await SeedAsync(db, tenantCtx, logger);
+    await EnsureRefreshTokensTableAsync(connectionString: app.Configuration.GetConnectionString("Default")!, logger);
+
+    if (app.Environment.IsDevelopment())
+    {
+        await SeedAsync(db, tenantCtx, logger);
+        await SeedAdminAsync(sp, logger);
+    }
+
     await ApplyRlsAsync(app.Configuration.GetConnectionString("Default")!, logger);
 }
 
@@ -116,7 +190,7 @@ static async Task SeedAsync(AppDbContext db, ITenantContext tenantCtx, ILogger l
     var tenantBId = Guid.Parse("bbbbbbbb-0000-0000-0000-000000000002");
 
     db.Tenants.AddRange(
-        new Tenant { Id = tenantAId, Name = "Acme Corp"  },
+        new Tenant { Id = tenantAId, Name = "Acme Corp" },
         new Tenant { Id = tenantBId, Name = "Globex Ltd" }
     );
     await db.SaveChangesAsync();
@@ -141,6 +215,38 @@ static async Task SeedAsync(AppDbContext db, ITenantContext tenantCtx, ILogger l
     }
 
     logger.LogInformation("Seeded 2 tenants with 5 contacts.");
+}
+
+static async Task SeedAdminAsync(IServiceProvider sp, ILogger logger)
+{
+    var roleManager = sp.GetRequiredService<RoleManager<IdentityRole<Guid>>>();
+    var userManager = sp.GetRequiredService<UserManager<ApplicationUser>>();
+    var db          = sp.GetRequiredService<AppDbContext>();
+
+    if (!await roleManager.RoleExistsAsync("admin"))
+        await roleManager.CreateAsync(new IdentityRole<Guid>("admin"));
+
+    const string adminEmail = "admin@jigsby.dev";
+    if (await userManager.FindByEmailAsync(adminEmail) is not null) return;
+
+    var tenant = await db.Tenants.FirstOrDefaultAsync();
+    if (tenant is null) return;
+
+    var admin = new ApplicationUser
+    {
+        Id          = Guid.NewGuid(),
+        UserName    = "admin",
+        Email       = adminEmail,
+        DisplayName = "System Admin",
+        TenantId    = tenant.Id
+    };
+
+    var result = await userManager.CreateAsync(admin, "Admin@Password123!!");
+    if (result.Succeeded)
+    {
+        await userManager.AddToRoleAsync(admin, "admin");
+        logger.LogInformation("Dev admin created — email: {Email}, password: Admin@Password123!!", adminEmail);
+    }
 }
 
 static async Task EnsureRefreshTokensTableAsync(string connectionString, ILogger logger)

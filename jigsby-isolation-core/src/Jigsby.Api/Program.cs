@@ -55,6 +55,7 @@ builder.Services
 
 builder.Services.AddAuthorization();
 builder.Services.AddSingleton<JwtTokenService>();
+builder.Services.AddScoped<RefreshTokenService>();
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
@@ -102,6 +103,7 @@ static async Task InitializeDatabaseAsync(WebApplication app)
     var tenantCtx        = scope.ServiceProvider.GetRequiredService<ITenantContext>();
 
     await db.Database.EnsureCreatedAsync();
+    await EnsureRefreshTokensTableAsync(app.Configuration.GetConnectionString("Default")!, logger);
     await SeedAsync(db, tenantCtx, logger);
     await ApplyRlsAsync(app.Configuration.GetConnectionString("Default")!, logger);
 }
@@ -139,6 +141,44 @@ static async Task SeedAsync(AppDbContext db, ITenantContext tenantCtx, ILogger l
     }
 
     logger.LogInformation("Seeded 2 tenants with 5 contacts.");
+}
+
+static async Task EnsureRefreshTokensTableAsync(string connectionString, ILogger logger)
+{
+    const string sql = """
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.tables
+            WHERE name = 'RefreshTokens' AND schema_id = SCHEMA_ID('dbo'))
+        BEGIN
+            CREATE TABLE dbo.RefreshTokens (
+                Id              UNIQUEIDENTIFIER NOT NULL PRIMARY KEY DEFAULT NEWID(),
+                UserId          UNIQUEIDENTIFIER NOT NULL,
+                Token           NVARCHAR(200)    NOT NULL,
+                CreatedAt       DATETIME2        NOT NULL,
+                ExpiresAt       DATETIME2        NOT NULL,
+                RevokedAt       DATETIME2        NULL,
+                ReplacedByToken NVARCHAR(200)    NULL,
+                CONSTRAINT FK_RefreshTokens_Users
+                    FOREIGN KEY (UserId) REFERENCES dbo.AspNetUsers(Id) ON DELETE CASCADE,
+                CONSTRAINT UQ_RefreshTokens_Token UNIQUE (Token)
+            );
+            CREATE INDEX IX_RefreshTokens_UserId ON dbo.RefreshTokens(UserId);
+        END
+        """;
+
+    try
+    {
+        await using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        await cmd.ExecuteNonQueryAsync();
+        logger.LogInformation("RefreshTokens table ready.");
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Failed to create RefreshTokens table.");
+    }
 }
 
 static async Task ApplyRlsAsync(string connectionString, ILogger logger)

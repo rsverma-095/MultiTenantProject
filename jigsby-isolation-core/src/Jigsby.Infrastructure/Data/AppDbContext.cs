@@ -31,9 +31,10 @@ public class AppDbContext : IdentityDbContext<ApplicationUser, IdentityRole<Guid
         _tenantContext = tenantContext;
     }
 
-    public DbSet<Tenant> Tenants => Set<Tenant>();
-    public DbSet<Company> Companies => Set<Company>();
-    public DbSet<Contact> Contacts => Set<Contact>();
+    public DbSet<Tenant>       Tenants       => Set<Tenant>();
+    public DbSet<Company>      Companies     => Set<Company>();
+    public DbSet<Contact>      Contacts      => Set<Contact>();
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -50,9 +51,17 @@ public class AppDbContext : IdentityDbContext<ApplicationUser, IdentityRole<Guid
             }
         }
 
-        // Composite indexes lead with TenantId, matching the shared-database guidance.
         modelBuilder.Entity<Contact>().HasIndex(c => new { c.TenantId, c.Email });
         modelBuilder.Entity<Company>().HasIndex(c => new { c.TenantId, c.Name });
+
+        modelBuilder.Entity<RefreshToken>(rt =>
+        {
+            rt.HasIndex(r => r.Token).IsUnique();
+            rt.HasOne(r => r.User)
+              .WithMany()
+              .HasForeignKey(r => r.UserId)
+              .OnDelete(DeleteBehavior.Cascade);
+        });
     }
 
     private static readonly System.Reflection.MethodInfo ApplyTenantFilterMethod =

@@ -5,15 +5,6 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Jigsby.Api.Controllers;
 
-/// <summary>
-/// Demonstrates that ordinary controller code needs no tenant-awareness at all.
-/// There is not a single "WHERE TenantId = ..." in here. The global query filter
-/// scopes the reads and SaveChanges stamps the writes, both from the ambient tenant
-/// context that the middleware established. This is the whole point: feature code
-/// built on top of this core cannot forget the tenant filter, because it never writes
-/// one. (Raw SQL is the exception that bypasses this layer; the database RLS layer is
-/// the backstop for that case.)
-/// </summary>
 [ApiController]
 [Route("api/[controller]")]
 public sealed class ContactsController : ControllerBase
@@ -29,8 +20,6 @@ public sealed class ContactsController : ControllerBase
     [HttpGet("{id:guid}")]
     public async Task<ActionResult<Contact>> Get(Guid id)
     {
-        // Even a direct id lookup cannot fetch another tenant's row: the query filter
-        // adds the tenant predicate, so a foreign id simply returns null here.
         var contact = await _db.Contacts.FirstOrDefaultAsync(c => c.Id == id);
         return contact is null ? NotFound() : contact;
     }
@@ -38,9 +27,35 @@ public sealed class ContactsController : ControllerBase
     [HttpPost]
     public async Task<ActionResult<Contact>> Create(Contact contact)
     {
-        // No TenantId is set here on purpose. SaveChanges stamps it from context.
+        contact.Id = Guid.NewGuid();
         _db.Contacts.Add(contact);
         await _db.SaveChangesAsync();
         return CreatedAtAction(nameof(Get), new { id = contact.Id }, contact);
+    }
+
+    [HttpPut("{id:guid}")]
+    public async Task<ActionResult<Contact>> Update(Guid id, Contact contact)
+    {
+        var existing = await _db.Contacts.FirstOrDefaultAsync(c => c.Id == id);
+        if (existing is null) return NotFound();
+
+        existing.FirstName = contact.FirstName;
+        existing.LastName  = contact.LastName;
+        existing.Email     = contact.Email;
+        existing.CompanyId = contact.CompanyId;
+
+        await _db.SaveChangesAsync();
+        return existing;
+    }
+
+    [HttpDelete("{id:guid}")]
+    public async Task<IActionResult> Delete(Guid id)
+    {
+        var existing = await _db.Contacts.FirstOrDefaultAsync(c => c.Id == id);
+        if (existing is null) return NotFound();
+
+        _db.Contacts.Remove(existing);
+        await _db.SaveChangesAsync();
+        return NoContent();
     }
 }

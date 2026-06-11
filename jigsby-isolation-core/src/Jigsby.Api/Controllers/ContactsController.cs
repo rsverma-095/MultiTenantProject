@@ -1,10 +1,12 @@
 using Jigsby.Core.Entities;
 using Jigsby.Infrastructure.Data;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
 namespace Jigsby.Api.Controllers;
 
+[Authorize]
 [ApiController]
 [Route("api/[controller]")]
 public sealed class ContactsController : ControllerBase

@@ -1,11 +1,15 @@
+using System.Text;
+using Jigsby.Api.Auth;
 using Jigsby.Api.Middleware;
 using Jigsby.Core.Entities;
 using Jigsby.Core.Tenancy;
 using Jigsby.Infrastructure.Data;
 using Jigsby.Infrastructure.Tenancy;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -15,22 +19,42 @@ builder.Services.AddSingleton<ITenantContext, AmbientTenantContext>();
 builder.Services.AddSingleton<TenantSessionConnectionInterceptor>();
 
 // --- Data ----------------------------------------------------------------------
-builder.Services.AddDbContext<AppDbContext>((serviceProvider, options) =>
-{
+builder.Services.AddDbContext<AppDbContext>((sp, options) =>
     options
         .UseSqlServer(builder.Configuration.GetConnectionString("Default"))
-        .AddInterceptors(serviceProvider.GetRequiredService<TenantSessionConnectionInterceptor>());
-});
+        .AddInterceptors(sp.GetRequiredService<TenantSessionConnectionInterceptor>()));
 
 // --- Identity ------------------------------------------------------------------
 builder.Services
-    .AddIdentityCore<ApplicationUser>(options =>
+    .AddIdentityCore<ApplicationUser>(o =>
     {
-        options.Password.RequiredLength = 12;
-        options.User.RequireUniqueEmail = true;
+        o.Password.RequiredLength  = 12;
+        o.User.RequireUniqueEmail  = true;
     })
     .AddRoles<IdentityRole<Guid>>()
     .AddEntityFrameworkStores<AppDbContext>();
+
+// --- JWT authentication --------------------------------------------------------
+var jwtKey = builder.Configuration["Jwt:Key"]!;
+
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(o =>
+    {
+        o.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer           = true,
+            ValidateAudience         = true,
+            ValidateLifetime         = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer              = builder.Configuration["Jwt:Issuer"],
+            ValidAudience            = builder.Configuration["Jwt:Audience"],
+            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
+        };
+    });
+
+builder.Services.AddAuthorization();
+builder.Services.AddSingleton<JwtTokenService>();
 
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
@@ -40,23 +64,31 @@ var app = builder.Build();
 // --- Database: create schema, seed, apply RLS ----------------------------------
 await InitializeDatabaseAsync(app);
 
-// --- Routes -------------------------------------------------------------------
+// --- API docs ------------------------------------------------------------------
 app.MapOpenApi();
-app.MapScalarApiReference(options =>
+app.MapScalarApiReference(o =>
 {
-    options.Title = "Jigsby API";
-    options.Theme = ScalarTheme.Purple;
+    o.Title = "Jigsby API";
+    o.Theme = ScalarTheme.Purple;
+    o.AddServer(new ScalarServer("http://localhost:5000"));
+    o.Authentication = new ScalarAuthenticationOptions
+    {
+        PreferredSecurityScheme = "Bearer"
+    };
 });
-app.MapGet("/", () => Results.Redirect("/scalar/v1"));
+app.MapGet("/", () => Results.Redirect("/scalar/v1")).AllowAnonymous();
 
-app.UseMiddleware<TenantResolutionMiddleware>();
+// --- Middleware pipeline (order matters) ---------------------------------------
+app.UseAuthentication();                           // 1. populate context.User from JWT
+app.UseMiddleware<TenantResolutionMiddleware>();   // 2. open tenant scope from claim or header
+app.UseAuthorization();                            // 3. enforce [Authorize]
 app.MapControllers();
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
-
-// Returns all tenants so you can copy an ID for the X-Tenant-Id header.
+// Public utility endpoints
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" })).AllowAnonymous();
 app.MapGet("/dev/tenants", async (AppDbContext db) =>
-    Results.Ok(await db.Tenants.OrderBy(t => t.Name).Select(t => new { t.Id, t.Name }).ToListAsync()));
+    Results.Ok(await db.Tenants.OrderBy(t => t.Name).Select(t => new { t.Id, t.Name }).ToListAsync()))
+   .AllowAnonymous();
 
 app.Run();
 
@@ -65,9 +97,9 @@ static async Task InitializeDatabaseAsync(WebApplication app)
 {
     var logger = app.Services.GetRequiredService<ILogger<Program>>();
 
-    using var scope = app.Services.CreateScope();
-    var db    = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    var tenantCtx = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+    using var scope      = app.Services.CreateScope();
+    var db               = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var tenantCtx        = scope.ServiceProvider.GetRequiredService<ITenantContext>();
 
     await db.Database.EnsureCreatedAsync();
     await SeedAsync(db, tenantCtx, logger);
@@ -139,5 +171,4 @@ static async Task ApplyRlsAsync(string connectionString, ILogger logger)
     }
 }
 
-// Exposed so the integration/leak test project can reference the composition root.
 public partial class Program { }
